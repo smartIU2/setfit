@@ -18,7 +18,6 @@ from .. import logging
 from ..modeling import SetFitModel
 from .aspect_extractor import AspectExtractor
 
-
 if TYPE_CHECKING:
     from spacy.tokens import Doc
 
@@ -39,10 +38,11 @@ class SpanSetFitModel(SetFitModel):
 
     def prepend_aspects(self, docs: List["Doc"], aspects_list: List[List[slice]]) -> Iterable[str]:
         for doc, aspects in zip(docs, aspects_list):
-            for aspect_slice in aspects:
-                aspect = doc[max(aspect_slice.start - self.span_context, 0) : aspect_slice.stop + self.span_context]
-                # TODO: Investigate performance difference of different formats
-                yield aspect.text + ":" + doc.text
+            for aspect in aspects:
+                if self.span_context == 0: #aspect_model
+                    yield aspect.text + ":" + doc.text
+                else: #polarity_model
+                    yield aspect.context + ":" + doc.text
 
     def __call__(self, docs: List["Doc"], aspects_list: List[List[slice]]) -> List[bool]:
         inputs_list = list(self.prepend_aspects(docs, aspects_list))
@@ -139,7 +139,7 @@ AspectModel.from_pretrained = types.MethodType(AspectModel.from_pretrained.__fun
 
 
 class PolarityModel(SpanSetFitModel):
-    def __init__(self, span_context: int = 3, **kwargs):
+    def __init__(self, span_context: int = 1, **kwargs):
         super().__init__(**kwargs)
         self.span_context = span_context
 
@@ -153,38 +153,34 @@ class AbsaModel:
     aspect_model: AspectModel
     polarity_model: PolarityModel
 
-    def gold_aspect_spans_to_aspects_list(self, inputs: Dataset) -> List[List[slice]]:
+    def gold_aspect_spans_to_aspects_list(self, inputs: Dataset) -> List[List['Aspect']]:
         # First group inputs by text
         grouped_data = defaultdict(list)
         for sample in inputs:
             text = sample.pop("text")
             grouped_data[text].append(sample)
 
-        # Get the spaCy docs
-        docs, _ = self.aspect_extractor(grouped_data.keys())
+        # Get the spaCy docs & aspects
+        docs, aspects = self.aspect_extractor(grouped_data.keys())
 
-        # Get the aspect spans for each doc by matching gold spans to the spaCy tokens
+        # Filter the aspects for each doc by matching to gold spans
         aspects_list = []
         index = -1
         skipped_indices = []
-        for doc, samples in zip(docs, grouped_data.values()):
+        for doc, aspects, samples in zip(docs, aspects, grouped_data.values()):
             aspects_list.append([])
             for sample in samples:
                 index += 1
-                match_objects = re.finditer(re.escape(sample["span"]), doc.text)
-                for i, match in enumerate(match_objects):
-                    if i == sample["ordinal"]:
-                        char_idx_start = match.start()
-                        char_idx_end = match.end()
-                        span = doc.char_span(char_idx_start, char_idx_end)
-                        if span is None:
-                            logger.warning(
-                                f"Aspect term {sample['span']!r} with ordinal {sample['ordinal']}, isn't a token in {doc.text!r} according to spaCy. "
+                matching_aspects = len([aspect for aspect in aspects if aspect.text == sample["span"]])
+                if sample["ordinal"] > matching_aspects - 1:
+                    logger.warning(
+                                f"Aspect term {sample['span']!r} with ordinal {sample['ordinal']}, isn't an aspect in {doc.text!r} according to aspect extractor. "
                                 "Skipping this sample."
                             )
-                            skipped_indices.append(index)
-                            continue
-                        aspects_list[-1].append(slice(span.start, span.end))
+                    skipped_indices.append(index)
+                else:
+                    aspects_list[-1].append(aspect)
+                    
         return docs, aspects_list, skipped_indices
 
     def predict_dataset(self, inputs: Dataset) -> Dataset:
@@ -258,14 +254,43 @@ class AbsaModel:
 
         polarity_list = self.polarity_model(docs, aspects_list)
         outputs = []
-        for docs, aspects, polarities in zip(docs, aspects_list, polarity_list):
+        for doc, aspects, polarities in zip(docs, aspects_list, polarity_list):
             outputs.append(
                 [
-                    {"span": docs[aspect_slice].text, "polarity": polarity}
-                    for aspect_slice, polarity in zip(aspects, polarities)
+                    {"span": doc[aspect.start:aspect.stop].text, "polarity": polarity}
+                    for aspect, polarity in zip(aspects, polarities)
                 ]
             )
         return outputs if not is_str else outputs[0]
+
+    def predict_to_docs(self, inputs: Union[str, List[str]]) -> Tuple[List["Doc"], List["Aspect"]]:
+        """Predicts aspects & their polarities of the given inputs.
+
+        Args:
+            Union[str, List[str]]: Either a sentence or a list of sentences.
+
+        Returns:
+            List[Doc]: A list of spacy docs
+            List[Aspect]: A list of aspects, incl. predicted polarity label
+        """
+
+        is_str = isinstance(inputs, str)
+        inputs_list = [inputs] if is_str else inputs
+
+        docs, aspects_list = self.aspect_extractor(inputs_list)
+        if sum(aspects_list, []) != []:
+           
+            aspects_list = self.aspect_model(docs, aspects_list)
+            if sum(aspects_list, []) != []:
+ 
+                polarity_list = self.polarity_model(docs, aspects_list)
+
+                for aspects, polarities in zip(aspects_list, polarity_list):
+                    for aspect, polarity in zip(aspects, polarities):
+                        aspect.label = polarity
+            
+        return (docs, aspects_list) if not is_str else (docs[0], aspects_list[0])
+
 
     @property
     def device(self) -> torch.device:
@@ -297,7 +322,8 @@ class AbsaModel:
         cls,
         model_id: str,
         polarity_model_id: Optional[str] = None,
-        spacy_model: Optional[str] = None,
+        spacy_model: Optional[Union[str, object]] = None,
+        spacy_disable_pipes: Optional[List[str]] = [],
         span_contexts: Tuple[Optional[int], Optional[int]] = (None, None),
         force_download: bool = None,
         resume_download: bool = None,
@@ -313,7 +339,10 @@ class AbsaModel:
         if len(model_id.split("@")) == 2:
             model_id, revision = model_id.split("@")
         if spacy_model:
-            model_kwargs["spacy_model"] = spacy_model
+            if isinstance(spacy_model, str):
+                model_kwargs["spacy_model"] = spacy_model
+            else:
+                model_kwargs["spacy_model"] = '_'.join([spacy_model.meta['lang'], spacy_model.meta['name']])
         aspect_model = AspectModel.from_pretrained(
             model_id,
             span_context=span_contexts[0],
@@ -361,7 +390,8 @@ class AbsaModel:
                 f"This model will use {repr(aspect_model.spacy_model)}."
             )
 
-        aspect_extractor = AspectExtractor(spacy_model=aspect_model.spacy_model)
+        aspect_extractor = AspectExtractor(spacy_model= spacy_model if spacy_model else aspect_model.spacy_model
+                                         , spacy_disable_pipes=spacy_disable_pipes)
 
         return cls(aspect_extractor, aspect_model, polarity_model)
 

@@ -79,6 +79,7 @@ class AbsaTrainer(ColumnMappingMixin):
         )
 
         # Set a better default value for the metric for best model for the aspect and polarity models
+        
         aspect_args = args if args is not None else TrainingArguments()
         polarity_args = (polarity_args or args or TrainingArguments()).copy()
         if aspect_args.metric_for_best_model == "embedding_loss":
@@ -120,53 +121,36 @@ class AbsaTrainer(ColumnMappingMixin):
             text = sample.pop("text")
             grouped_data[text].append(sample)
 
-        def index_ordinal(text: str, target: str, ordinal: int) -> Tuple[int, int]:
-            find_from = 0
-            for _ in range(ordinal + 1):
-                start_idx = text.index(target, find_from)
-                find_from = start_idx + 1
-            return start_idx, start_idx + len(target)
-
-        def overlaps(aspect: slice, aspects: List[slice]) -> bool:
-            for test_aspect in aspects:
-                overlapping_indices = set(range(aspect.start, aspect.stop + 1)) & set(
-                    range(test_aspect.start, test_aspect.stop + 1)
-                )
-                if overlapping_indices:
-                    return True
-            return False
 
         docs, aspects_list = self.aspect_extractor(grouped_data.keys())
         aspect_aspect_list = []
         aspect_labels = []
         polarity_aspect_list = []
         polarity_labels = []
-        for doc, aspects, text in zip(docs, aspects_list, grouped_data):
+        for aspects, text in zip(aspects_list, grouped_data):
             # Collect all of the gold aspects
             gold_aspects = []
             gold_polarity_labels = []
             for annotation in grouped_data[text]:
-                try:
-                    start, end = index_ordinal(text, annotation["span"], annotation["ordinal"])
-                except ValueError:
+            
+                matching_aspects = [aspect for aspect in aspects if aspect.text == annotation["span"]]
+                if annotation["ordinal"] > len(matching_aspects) - 1:
                     logger.info(
-                        f"The ordinal of {annotation['ordinal']} for span {annotation['span']!r} in {text!r} is too high. "
+                        f"Aspect term {annotation['span']!r} with ordinal {annotation['ordinal']}, isn't an aspect in {text!r} according to aspect extractor. "
                         "Skipping this sample."
                     )
                     continue
 
-                gold_aspect_span = doc.char_span(start, end)
-                if gold_aspect_span is None:
-                    continue
-                gold_aspects.append(slice(gold_aspect_span.start, gold_aspect_span.end))
+                gold_aspect_span = matching_aspects[annotation["ordinal"]]
+                gold_aspects.append(gold_aspect_span)
                 gold_polarity_labels.append(annotation["label"])
 
-            # The Aspect model uses all gold aspects as "True", and all non-overlapping predicted
-            # aspects as "False"
+            # The Aspect model uses all gold aspects as "True"
+            # and all non-overlapping predicted aspects as "False"
             aspect_labels.extend([True] * len(gold_aspects))
             aspect_aspect_list.append(gold_aspects[:])
             for aspect in aspects:
-                if not overlaps(aspect, gold_aspects):
+                if not any([aspect.start < gold_aspect.stop and aspect.stop > gold_aspect.start for gold_aspect in gold_aspects]):
                     aspect_labels.append(False)
                     aspect_aspect_list[-1].append(aspect)
 
